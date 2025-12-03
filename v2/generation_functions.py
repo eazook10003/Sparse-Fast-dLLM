@@ -2,13 +2,14 @@ from typing import Callable, Optional, Union
 import torch
 import types
 from transformers.utils import auto_docstring, logging
+from transformers.cache_utils import DynamicCache
 
 # Constants for Fast_dLLM model
 FAST_DLLM_MASK_ID = 151665
 FAST_DLLM_STOP_TOKEN = 151645
 
 MASK_COLOR = 0.5  
-TOKEN_COLOR = -0.5  
+TOKEN_COLOR = -0.5
 
 @auto_docstring
 class Fast_dLLM_QwenForCausalLM:
@@ -29,12 +30,21 @@ class Fast_dLLM_QwenForCausalLM:
         use_block_cache=False,
         top_p=0.95,
         temperature=0.0,
+        use_sparse=True,  # True = sparse cache, False = baseline (dense cache only)
+        keep_ratio=0.5,   # Ratio of KV cache to keep after sparsification
+        pool_kernel_size=3,  # Kernel size for max pooling in importance scoring
+        delay_step=1,     # Number of steps before applying sparse cache
     ):
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
 
+        cache_state = 0
+        sparse_past_key_values = None
+        
+        #### for prompt block ####
         if min_len > block_size:
-            output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
+            cache_state = 0 #### since we don't have any cache to sparse in prompt block.
+            output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size, cache_state=cache_state, delay_step=delay_step, sparse_past_key_values=sparse_past_key_values, use_sparse=use_sparse, keep_ratio=keep_ratio, pool_kernel_size=pool_kernel_size)
             logits, past_key_values = output.logits, output.past_key_values
             if min_len % block_size == 0:
                 predict_sample_idx = (seq_len == min_len)
@@ -56,6 +66,7 @@ class Fast_dLLM_QwenForCausalLM:
         sample_indices = torch.arange(batch_size, device=self.device)
         finished_samples = {}
         for block_idx in range(start_block_idx, num_blocks):
+
             if finished_flag.all():
                 break
             if (seq_block_idx == block_idx).all():
@@ -69,8 +80,11 @@ class Fast_dLLM_QwenForCausalLM:
             x_t = x_init.clone()
             step = 0
             block_past_key_values = None
+            sparse_past_key_values = DynamicCache()  # Initialize sparse cache for each block
             while True:
                 mask_idx = (x_t[:, -block_size:] == mask_id)
+
+                #### when all tokens in currentn block is unmasked ####
                 if mask_idx.sum() == 0:
                     for sample_idx in range(x_t.shape[0]):
                         if finished_flag[sample_idx] and seq_len[sample_idx] < (block_idx + 1) * block_size:
@@ -78,7 +92,10 @@ class Fast_dLLM_QwenForCausalLM:
                             x_t[sample_idx, seq_len[sample_idx]+stop_token_idx+1:] = tokenizer.pad_token_id
                     if finished_flag.all():
                         break
-                    output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size)
+
+                    # Use sparse cache (2) only if use_sparse=True and we've passed the delay step
+                    cache_state = 2 if (use_sparse and step > delay_step) else 0
+                    output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size, cache_state=cache_state, delay_step=delay_step, sparse_past_key_values=sparse_past_key_values, use_sparse=use_sparse, keep_ratio=keep_ratio, pool_kernel_size=pool_kernel_size)
                     logits, past_key_values = output.logits, output.past_key_values
                     next_token = logits[:, -1:, :].argmax(dim=-1)
                     next_token[finished_flag] = tokenizer.pad_token_id
@@ -88,6 +105,7 @@ class Fast_dLLM_QwenForCausalLM:
                     break
                 
                 for small_block_idx in range(num_small_blocks):
+
                     small_block_start_idx = small_block_idx * small_block_size
                     small_block_end_idx = small_block_start_idx + small_block_size
 
@@ -99,16 +117,33 @@ class Fast_dLLM_QwenForCausalLM:
                             break
                         
                         if use_block_cache:
+                            if step == delay_step: #### @ delay step, filter cache but compute with dense cache
+                                cache_state = 1 
+                            elif step < delay_step: #### under delay step,compute with dense cache
+                                cache_state = 0 
+                            else: #### after delay step, compute with sparse cache
+                                cache_state = 2
+                            
                             if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
-                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
+                   
+                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, cache_state=cache_state, delay_step=delay_step, sparse_past_key_values=sparse_past_key_values, use_sparse=use_sparse, keep_ratio=keep_ratio, pool_kernel_size=pool_kernel_size)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                                 logits = logits[:, start:end]
                             else:
-                                logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
+          
+                                logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx, cache_state=cache_state, delay_step=delay_step, sparse_past_key_values=sparse_past_key_values, use_sparse=use_sparse, keep_ratio=keep_ratio, pool_kernel_size=pool_kernel_size).logits
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                         else:
-                            logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                            
+                            if step == delay_step: #### @ delay step, filter cache but compute with dense cache
+                                cache_state = 1 
+                            elif step < delay_step: #### under delay step,compute with dense cache
+                                cache_state = 0 
+                            else: #### after delay step, compute with sparse cache
+                                cache_state = 2
+
+                            logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, cache_state=cache_state, delay_step=delay_step, sparse_past_key_values=sparse_past_key_values, use_sparse=use_sparse, keep_ratio=keep_ratio, pool_kernel_size=pool_kernel_size).logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                             logits = logits[:, start:end]
                         x_1, p_1t = self.sample_with_top_p(logits, top_p=top_p, temperature=temperature)

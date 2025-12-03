@@ -60,6 +60,10 @@ class Fast_dLLM_v2EvalHarness(LM):
         small_block_size=8,
         bd_size=32,
         threshold=0.9,
+        use_sparse=True,  # True = sparse cache, False = baseline (dense cache only)
+        keep_ratio=0.5,   # Ratio of KV cache to keep after sparsification
+        pool_kernel_size=3,  # Kernel size for max pooling in importance scoring
+        delay_step=1,     # Number of steps before applying sparse cache
         **kwargs,
     ):
 
@@ -107,6 +111,10 @@ class Fast_dLLM_v2EvalHarness(LM):
         self.small_block_size = small_block_size
         self.threshold = threshold
         self.bd_size = bd_size
+        self.use_sparse = str(use_sparse).lower() in ('true', '1', 'yes')  # Parse string to bool
+        self.keep_ratio = float(keep_ratio)
+        self.pool_kernel_size = int(pool_kernel_size)
+        self.delay_step = int(delay_step)
 
     @property
     def rank(self):
@@ -207,8 +215,14 @@ class Fast_dLLM_v2EvalHarness(LM):
     def generate_until(self, requests):
         output = [None] * len(requests)  # pre-allocate output list
         num_tokens = 0
+        peak_memory_sum = 0.0
+        num_batches = 0
         
         start_time = time.time()
+        
+        # Clear cache and reset memory stats at start
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         
         requests_with_indices = [(i, req) for i, req in enumerate(requests)]
         requests_with_indices.sort(key=lambda x: len(x[1].args[0]))
@@ -248,6 +262,9 @@ class Fast_dLLM_v2EvalHarness(LM):
             batched_input_ids = torch.cat(batched_input_ids, dim=0)
             batched_input_ids = batched_input_ids.to(self.device)
             
+            # Reset peak memory stats before batch
+            torch.cuda.reset_peak_memory_stats()
+            
             with torch.no_grad():
                 if self.accelerator is not None:
                     generated_ids = self.accelerator.unwrap_model(self.model).mdm_sample(
@@ -261,6 +278,10 @@ class Fast_dLLM_v2EvalHarness(LM):
                         seq_len=torch.tensor(seq_len, device=self.device),
                         use_block_cache=self.use_block_cache,
                         threshold=self.threshold,
+                        use_sparse=self.use_sparse,
+                        keep_ratio=self.keep_ratio,
+                        pool_kernel_size=self.pool_kernel_size,
+                        delay_step=self.delay_step,
                     )
                 else:
                     generated_ids = self.model.mdm_sample(
@@ -274,7 +295,17 @@ class Fast_dLLM_v2EvalHarness(LM):
                         seq_len=torch.tensor(seq_len, device=self.device),
                         use_block_cache=self.use_block_cache,
                         threshold=self.threshold,
+                        use_sparse=self.use_sparse,
+                        keep_ratio=self.keep_ratio,
+                        pool_kernel_size=self.pool_kernel_size,
+                        delay_step=self.delay_step,
                     )
+            
+            # Track peak memory for this batch
+            torch.cuda.synchronize()
+            batch_peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)  # Convert to GB
+            peak_memory_sum += batch_peak_memory
+            num_batches += 1
             
             # extract new generated tokens, and keep original index order
             for batch_pos, (orig_idx, req) in enumerate(batch):
@@ -297,9 +328,17 @@ class Fast_dLLM_v2EvalHarness(LM):
             
         end_time = time.time()
         if self.show_speed:
+            print(f"\n{'='*50}")
+            print(f"Performance Metrics:")
+            print(f"{'='*50}")
             print(f"Total number of tokens generated: {num_tokens}")
-            print(f"Total time taken: {end_time - start_time} seconds")
-            print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
+            print(f"Total time taken: {end_time - start_time:.2f} seconds")
+            print(f"Tokens per second: {num_tokens / (end_time - start_time):.2f}")
+            print(f"\nMemory Metrics:")
+            print(f"{'='*50}")
+            print(f"Average peak GPU memory per batch: {peak_memory_sum / num_batches:.2f} GB")
+            print(f"Total batches: {num_batches}")
+            print(f"{'='*50}\n")
             
         return output
 

@@ -14,7 +14,7 @@ To enable Sparse-dLLM style cache eviction for Fast-dLLM v2:
 keep_ratio=0.5        # Ratio of KV cache to keep (0.0 to 1.0)
 pool_kernel_size=3    # Kernel size for max pooling in importance scoring
 delay_step=1          # Steps to run before applying sparse cache
-
+```
 
 # Fast-dLLM v2: Efficient Block-Diffusion Large Language Model
 

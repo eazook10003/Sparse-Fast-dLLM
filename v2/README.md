@@ -1,12 +1,19 @@
-1. First, load the model once to create the cache director
-2. Locate the cache directory (the <commit_hash> will be a long hash string like 200e3eff9223d719e97e561c2291566d9b1cc28d)
-3. Copy the contents of sparse_modeling.py into modeling.py in that directory, or replace the existing modeling.py with the sparse version
-4. The sparse cache parameters can then be configured via eval_script.sh
-```keep_ratio=0.5            # Ratio of KV cache to keep (0.0-1.0)
-   pool_kernel_size=3        # Kernel size for max pooling in importance scoring
-   delay_step=1              # Steps before applying sparse cache```
+### Enabling Sparse KV Cache for Fast-dLLM v2
 
+To enable Sparse-dLLM style cache eviction for Fast-dLLM v2:
 
+1. Load the model once so that it creates the local cache directory.
+2. Locate the cache directory. Its path will include a commit hash, for example:  
+   `~/.cache/huggingface/modules/transformers_modules/Efficient-Large-Model__Fast_dLLM_v2_7B/<commit_hash>/`
+3. In that directory, replace `modeling.py` with the sparse version:  
+   - Either overwrite `modeling.py` with `sparse_modeling.py`, or  
+   - Copy the contents of `sparse_modeling.py` into `modeling.py`.
+4. Configure the sparse cache hyperparameters in `eval_script.sh`:
+
+```bash
+keep_ratio=0.5        # Ratio of KV cache to keep (0.0 to 1.0)
+pool_kernel_size=3    # Kernel size for max pooling in importance scoring
+delay_step=1          # Steps to run before applying sparse cache
 
 
 # Fast-dLLM v2: Efficient Block-Diffusion Large Language Model

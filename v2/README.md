@@ -1,3 +1,14 @@
+1. First, load the model once to create the cache director
+2. Locate the cache directory (the <commit_hash> will be a long hash string like 200e3eff9223d719e97e561c2291566d9b1cc28d)
+3. Copy the contents of sparse_modeling.py into modeling.py in that directory, or replace the existing modeling.py with the sparse version
+4. The sparse cache parameters can then be configured via eval_script.sh
+```keep_ratio=0.5            # Ratio of KV cache to keep (0.0-1.0)
+   pool_kernel_size=3        # Kernel size for max pooling in importance scoring
+   delay_step=1              # Steps before applying sparse cache```
+
+
+
+
 # Fast-dLLM v2: Efficient Block-Diffusion Large Language Model
 
 [![Project](https://img.shields.io/static/v1?label=Project&message=Github&color=blue&logo=github-pages)](https://nvlabs.github.io/Fast-dLLM/v2)

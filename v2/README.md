@@ -16,6 +16,57 @@ pool_kernel_size=3    # Kernel size for max pooling in importance scoring
 delay_step=1          # Steps to run before applying sparse cache
 ```
 
+### How to obtain per layer retention ratios from attention
+
+To derive per layer retention ratios, we measure how many cached tokens are needed so that the combined attention to:
+
+- the cached prefix, and  
+- the current decoding block  
+
+reaches a target coverage (for example 90%, 95%, 99%).
+
+Below is a minimal example that computes, for a single layer, the retention ratio at different coverage thresholds from the attention weights:
+
+```python
+batch_size, num_heads, query_len, key_len = attn_weights.shape
+
+# Number of cached prefix tokens
+cache_len = prefix_cache_len
+
+# Split attention into cache part and current block part
+cache_attn = attn_weights[:, :, :, :cache_len]        
+current_block_attn = attn_weights[:, :, :, cache_len:]
+
+# Total attention to the current block
+current_block_sum = current_block_attn.sum(dim=-1)
+
+# Sort cache attention in descending order and compute cumulative sums
+sorted_cache_attn, _ = torch.sort(cache_attn, dim=-1, descending=True)
+cumsum_cache_attn = torch.cumsum(sorted_cache_attn, dim=-1)
+
+thresholds = [0.90, 0.95, 0.99]
+
+
+for thresh in thresholds:
+    # Attention mass that still needs to come from the cache
+    required_from_cache = (thresh - current_block_sum).clamp(min=0.0)
+
+    # For each query, find smallest k where cumulative cache attention
+    # reaches required_from_cache
+    mask = cumsum_cache_attn >= required_from_cache.unsqueeze(-1)      
+    k_needed = mask.int().argmax(dim=-1) + 1                           
+
+    # If the current block alone already satisfies the threshold, k_needed = 0
+    k_needed = torch.where(required_from_cache <= 0, torch.zeros_like(k_needed), k_needed)
+
+    # Use the maximum k across batch, heads, and query positions (conservative choice)
+    max_k = k_needed.float().max().item()
+
+    # Convert to retention ratio relative to the cache length
+    retention_ratio = max_k / cache_len if cache_len > 0 else 0.0
+
+```
+
 # Fast-dLLM v2: Efficient Block-Diffusion Large Language Model
 
 [![Project](https://img.shields.io/static/v1?label=Project&message=Github&color=blue&logo=github-pages)](https://nvlabs.github.io/Fast-dLLM/v2)
